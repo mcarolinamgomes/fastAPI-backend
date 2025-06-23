@@ -3,6 +3,7 @@ import numpy as np
 import tensorflow as tf
 from PIL import Image, ImageOps
 
+
 # Constants
 img_height, img_width = 180, 180
 class_labels = ['asthmatic', 'healthy']
