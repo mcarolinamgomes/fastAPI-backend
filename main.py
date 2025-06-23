@@ -25,6 +25,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 
 
+
 # Utility functions
 def blurred_frame_differencing(frame1, frame2):
     blurred_frame1 = cv2.GaussianBlur(frame1, (5, 5), 0)
