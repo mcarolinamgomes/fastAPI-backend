@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from inf_video import predict_frames_in_directory, predict_from_two_directories
 import shutil
@@ -24,8 +25,6 @@ app.add_middleware(
 logging.basicConfig(level=logging.DEBUG)
 
 
-
-
 # Utility functions
 def blurred_frame_differencing(frame1, frame2):
     blurred_frame1 = cv2.GaussianBlur(frame1, (5, 5), 0)
@@ -45,14 +44,16 @@ def extract_nostrils_from_video(video_path, input_dir, temp_dir):
 
 def process_frame(model, frame_path, roi_dir):
     img = cv2.imread(frame_path)
+    if img is None:
+        logging.warning(f"Could not read frame: {frame_path}")
+        return
     results = model(img)
     boxes = results[0].boxes.xyxy.tolist()
-    for idx, (box) in enumerate(boxes):
+    for idx, box in enumerate(boxes):
         x1, y1, x2, y2 = [int(coord) for coord in box]
         cropped_img = img[y1:y2, x1:x2]
-        output = os.path.join(roi_dir, frame_path.split('/')[-1])
+        output = os.path.join(roi_dir, os.path.basename(frame_path))
         cv2.imwrite(output, cropped_img)
-
 
 def subtract(video_path, input_dir, temp_dir):
     output_dir = os.path.join(temp_dir, 'subtracted_frames')
@@ -60,8 +61,11 @@ def subtract(video_path, input_dir, temp_dir):
 
     frame_files = sorted(
         [f for f in os.listdir(input_dir) if f.endswith('.jpg')],
-        key=lambda f: int(re.findall(r'\d+', f)[0])
+        key=lambda f: int(re.findall(r'\d+', f)[0]) if re.findall(r'\d+', f) else 0
     )
+
+    if len(frame_files) < 2:
+        raise ValueError("Not enough frames to perform subtraction.")
 
     for i in range(len(frame_files) - 1):
         frame1_path = os.path.join(input_dir, frame_files[i])
@@ -73,11 +77,12 @@ def subtract(video_path, input_dir, temp_dir):
 def subtract_frames(frame1_path, frame2_path, output_dir, idx):
     frame1 = cv2.imread(frame1_path)
     frame2 = cv2.imread(frame2_path)
+    if frame1 is None or frame2 is None:
+        logging.warning(f"Skipping subtraction due to unreadable frame(s): {frame1_path}, {frame2_path}")
+        return
+
     if frame1.shape != frame2.shape:
-        if frame1.size < frame2.size:
-            frame1 = cv2.resize(frame1, (frame2.shape[1], frame2.shape[0]))
-        else:
-            frame2 = cv2.resize(frame2, (frame1.shape[1], frame1.shape[0]))
+        frame2 = cv2.resize(frame2, (frame1.shape[1], frame1.shape[0]))
 
     subtracted_frame = blurred_frame_differencing(frame1, frame2)
     output_frame_path = os.path.join(output_dir, f'frame_{idx}.jpg')
@@ -104,7 +109,8 @@ def process_video(video_path, extract_nostrils, temp_dir, return_dir=False):
             if not ret:
                 break
             if frame is None:
-                raise ValueError("Captured frame is None")
+                logging.warning("Captured frame is None, skipping...")
+                continue
             if count % frame_skip == 0:
                 gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 frame_path = os.path.join(output_dir, f'frame_{count}.jpg')
@@ -112,6 +118,9 @@ def process_video(video_path, extract_nostrils, temp_dir, return_dir=False):
             count += 1
     finally:
         cap.release()
+
+    if not os.listdir(output_dir):
+        raise ValueError("No frames were extracted from video.")
 
     if extract_nostrils:
         roi_dir = extract_nostrils_from_video(video_path, output_dir, temp_dir)
@@ -122,8 +131,11 @@ def process_video(video_path, extract_nostrils, temp_dir, return_dir=False):
     if return_dir:
         return subtracted_dir
 
-    model_dir = 'models/best_nostrils_model.keras' if extract_nostrils else 'models/best_abdomen_model.keras'
-    result = predict_frames_in_directory(subtracted_dir, model_dir)
+    model_path = 'models/best_nostrils_model.keras' if extract_nostrils else 'models/best_abdomen_model.keras'
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    result = predict_frames_in_directory(subtracted_dir, model_path)
     return result
 
 @app.post("/predict")
@@ -132,34 +144,40 @@ async def predict(
     video2: UploadFile = File(None),
     model_type: str = Form(...)
 ):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        path1 = os.path.join(temp_dir, secure_filename(video1.filename))
-        with open(path1, "wb") as f:
-            shutil.copyfileobj(video1.file, f)
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path1 = os.path.join(temp_dir, secure_filename(video1.filename))
+            with open(path1, "wb") as f:
+                shutil.copyfileobj(video1.file, f)
 
-        if model_type == "Both":
-            if not video2:
-                return {"error": "Both videos are required for the combined model."}
+            if model_type == "Both":
+                if not video2:
+                    return JSONResponse(status_code=400, content={"error": "Both videos are required for the combined model."})
 
-            path2 = os.path.join(temp_dir, secure_filename(video2.filename))
-            with open(path2, "wb") as f:
-                shutil.copyfileobj(video2.file, f)
+                path2 = os.path.join(temp_dir, secure_filename(video2.filename))
+                with open(path2, "wb") as f:
+                    shutil.copyfileobj(video2.file, f)
 
-            nostrils_dir = process_video(path1, extract_nostrils=True, temp_dir=temp_dir, return_dir=True)
-            abdomen_dir = process_video(path2, extract_nostrils=False, temp_dir=temp_dir, return_dir=True)
-            result = predict_from_two_directories(nostrils_dir, abdomen_dir, 'models/best_both_model.keras')
+                nostrils_dir = process_video(path1, extract_nostrils=True, temp_dir=temp_dir, return_dir=True)
+                abdomen_dir = process_video(path2, extract_nostrils=False, temp_dir=temp_dir, return_dir=True)
 
-        elif model_type == "Nostrils":
-            result = process_video(path1, extract_nostrils=True, temp_dir=temp_dir)
+                model_path = 'models/best_both_model.keras'
+                if not os.path.exists(model_path):
+                    raise FileNotFoundError(f"Model file not found: {model_path}")
 
-        elif model_type == "Abdomen":
-            result = process_video(path1, extract_nostrils=False, temp_dir=temp_dir)
+                result = predict_from_two_directories(nostrils_dir, abdomen_dir, model_path)
 
-        else:
-            return {"error": f"Invalid model_type '{model_type}'. Choose 'Nostrils', 'Abdomen', or 'Both'."}
+            elif model_type == "Nostrils":
+                result = process_video(path1, extract_nostrils=True, temp_dir=temp_dir)
 
-        return {"result": result}
+            elif model_type == "Abdomen":
+                result = process_video(path1, extract_nostrils=False, temp_dir=temp_dir)
 
+            else:
+                return JSONResponse(status_code=400, content={"error": f"Invalid model_type '{model_type}'. Choose 'Nostrils', 'Abdomen', or 'Both'."})
 
+            return {"result": result}
 
-
+    except Exception as e:
+        logging.exception("Error occurred during prediction")
+        return JSONResponse(status_code=500, content={"error": str(e)})
